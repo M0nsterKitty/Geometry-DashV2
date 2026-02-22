@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Geometry Dash Lite</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #0f172a;
+      touch-action: manipulation;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, sans-serif;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+      image-rendering: auto;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <script>
+  (() => {
+    'use strict';
+
+    // --- Canvas + viewport -------------------------------------------------
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+
+    const BASE_W = 960;
+    const BASE_H = 540;
+    let cssW = 0, cssH = 0, dpr = 1;
+    let scale = 1, viewW = BASE_W, viewH = BASE_H;
+
+    function resize() {
+      cssW = window.innerWidth;
+      cssH = window.innerHeight;
+      dpr = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width = Math.max(1, Math.floor(cssW * dpr));
+      canvas.height = Math.max(1, Math.floor(cssH * dpr));
+      scale = Math.min(cssW / BASE_W, cssH / BASE_H);
+      viewW = BASE_W;
+      viewH = BASE_H;
+    }
+    window.addEventListener('resize', resize, { passive: true });
+    resize();
+
+    // --- Audio (single context, tiny synthesized jump sound) --------------
+    let audioCtx = null;
+    let audioUnlocked = false;
+
+    function ensureAudio() {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (!audioUnlocked && audioCtx.state === 'suspended') audioCtx.resume();
+      audioUnlocked = true;
+    }
+
+    function playJumpSound() {
+      if (!audioCtx || audioCtx.state !== 'running') return;
+      const now = audioCtx.currentTime;
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'square';
+      osc.frequency.setValueAtTime(880, now);
+      osc.frequency.exponentialRampToValueAtTime(330, now + 0.08);
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.09, now + 0.005);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.09);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start(now);
+      osc.stop(now + 0.095);
+    }
+
+    // --- Utilities ---------------------------------------------------------
+    const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+    const lerp = (a, b, t) => a + (b - a) * t;
+
+    // --- Characters --------------------------------------------------------
+    const CHARACTERS = [
+      { id: 0, name: 'Smiling square', color: '#60a5fa' },
+      { id: 1, name: 'Round blob', color: '#34d399' },
+      { id: 2, name: 'Mini robot', color: '#f59e0b' },
+      { id: 3, name: 'Tiny cat block', color: '#f472b6' }
+    ];
+
+    // --- Game state --------------------------------------------------------
+    const STATE_MENU = 0;
+    const STATE_PLAY = 1;
+    const STATE_WIN = 2;
+
+    let state = STATE_MENU;
+    let selectedChar = 0;
+
+    const world = {
+      groundY: 420,
+      scroll: 0,
+      baseSpeed: 270,
+      speed: 270,
+      speedScale: 1,
+      difficulty: 0,
+      score: 0,
+      scoreRate: 16,
+      spawnTimer: 0,
+      spawnInterval: 1.5,
+      stopSpawn: false,
+      bgT: 0,
+      winT: 0,
+      winTextT: 0,
+      cameraShake: 0
+    };
+
+    const player = {
+      x: 150,
+      y: 0,
+      w: 44,
+      h: 44,
+      vy: 0,
+      gravity: 2200,
+      jumpV: -760,
+      onGround: false,
+      bounceT: 0
+    };
+
+    function resetPlayer() {
+      player.x = 150;
+      player.w = 44;
+      player.h = 44;
+      player.y = world.groundY - player.h;
+      player.vy = 0;
+      player.onGround = true;
+      player.bounceT = 0;
+    }
+
+    function resetWorld() {
+      world.scroll = 0;
+      world.baseSpeed = 270;
+      world.speed = 270;
+      world.speedScale = 1;
+      world.difficulty = 0;
+      world.score = 0;
+      world.scoreRate = 16;
+      world.spawnTimer = 0;
+      world.spawnInterval = 1.45;
+      world.stopSpawn = false;
+      world.bgT = 0;
+      world.winT = 0;
+      world.winTextT = 0;
+      world.cameraShake = 0;
+      obstacleCount = 0;
+      particleCount = 0;
+      resetPlayer();
+    }
+
+    function startGame() {
+      resetWorld();
+      state = STATE_PLAY;
+    }
+
+    function returnToMenu() {
+      state = STATE_MENU;
+      resetWorld();
+    }
+
+    // --- Input (low-latency, no buffering queue) --------------------------
+    let jumpPressed = false;
+    function onPress(e) {
+      if (e) e.preventDefault();
+      ensureAudio();
+      jumpPressed = true;
+    }
+
+    window.addEventListener('pointerdown', onPress, { passive: false });
+    window.addEventListener('mousedown', onPress, { passive: false });
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Space') {
+        e.preventDefault();
+        onPress(e);
+      }
+    }, { passive: false });
+
+    // --- Obstacle pooling --------------------------------------------------
+    const OB_MAX = 64;
+    const obstacles = new Array(OB_MAX);
+    let obstacleCount = 0;
+
+    function makeObstacle() {
+      return {
+        active: false,
+        type: 0,
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 0,
+        phase: 0,
+        amp: 0,
+        speedY: 0
+      };
+    }
+    for (let i = 0; i < OB_MAX; i++) obstacles[i] = makeObstacle();
+
+    function allocObstacle() {
+      for (let i = 0; i < OB_MAX; i++) {
+        const o = obstacles[i];
+        if (!o.active) {
+          o.active = true;
+          obstacleCount++;
+          return o;
+        }
+      }
+      return null;
+    }
+
+    function freeObstacle(o) {
+      if (!o.active) return;
+      o.active = false;
+      obstacleCount--;
+    }
+
+    // types: 0 single spike, 1 double spike, 2 moving block, 3 narrow gap pillars, 4 floating platform
+    function spawnObstacle() {
+      const o = allocObstacle();
+      if (!o) return;
+      const t = (Math.random() * 5) | 0;
+      o.type = t;
+      o.phase = Math.random() * Math.PI * 2;
+      o.x = viewW + 40;
+      o.amp = 0;
+      o.speedY = 0;
+
+      if (t === 0) { // single spike
+        o.w = 34; o.h = 34;
+        o.y = world.groundY - o.h;
+      } else if (t === 1) { // double spike
+        o.w = 70; o.h = 34;
+        o.y = world.groundY - o.h;
+      } else if (t === 2) { // moving block
+        o.w = 42; o.h = 42;
+        o.y = world.groundY - o.h - 10;
+        o.amp = 46;
+        o.speedY = 2.6;
+      } else if (t === 3) { // narrow gap (top pillar)
+        o.w = 38; o.h = 130;
+        o.y = world.groundY - o.h - 68;
+      } else { // floating platform to jump under/over timing
+        o.w = 68; o.h = 20;
+        o.y = world.groundY - 110;
+      }
+    }
+
+    // --- Particles (small fixed pool) -------------------------------------
+    const P_MAX = 56;
+    const particles = new Array(P_MAX);
+    let particleCount = 0;
+    for (let i = 0; i < P_MAX; i++) particles[i] = { active: false, x:0,y:0,vx:0,vy:0,life:0,size:0 };
+
+    function emitWinParticles() {
+      for (let i = 0; i < P_MAX; i++) {
+        const p = particles[i];
+        if (p.active) continue;
+        p.active = true;
+        particleCount++;
+        const a = Math.random() * Math.PI * 2;
+        const s = 80 + Math.random() * 180;
+        p.x = player.x + player.w * 0.5;
+        p.y = player.y + player.h * 0.5;
+        p.vx = Math.cos(a) * s;
+        p.vy = Math.sin(a) * s - 40;
+        p.life = 0.8 + Math.random() * 0.5;
+        p.size = 2 + Math.random() * 3;
+      }
+    }
+
+    function updateParticles(dt) {
+      for (let i = 0; i < P_MAX; i++) {
+        const p = particles[i];
+        if (!p.active) continue;
+        p.life -= dt;
+        if (p.life <= 0) { p.active = false; particleCount--; continue; }
+        p.vy += 300 * dt;
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+      }
+    }
+
+    // --- Collisions --------------------------------------------------------
+    function overlap(ax, ay, aw, ah, bx, by, bw, bh) {
+      return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+    }
+
+    function obstacleHit(o, px, py, pw, ph) {
+      if (o.type === 0) {
+        return overlap(px, py, pw, ph, o.x + 5, o.y + 8, o.w - 10, o.h - 8);
+      }
+      if (o.type === 1) {
+        return overlap(px, py, pw, ph, o.x + 2, o.y + 8, o.w - 4, o.h - 8);
+      }
+      if (o.type === 2 || o.type === 4) {
+        return overlap(px, py, pw, ph, o.x, o.y, o.w, o.h);
+      }
+      // narrow gap: two pillars with tight gap center
+      const topH = o.h;
+      const bottomY = o.y + o.h + 88;
+      const bottomH = world.groundY - bottomY;
+      return overlap(px, py, pw, ph, o.x, o.y, o.w, topH) ||
+             overlap(px, py, pw, ph, o.x, bottomY, o.w, bottomH);
+    }
+
+    // --- Update ------------------------------------------------------------
+    function doJumpIfRequested() {
+      if (!jumpPressed) return;
+      jumpPressed = false;
+
+      if (state === STATE_MENU) {
+        // menu hit-test on character cards
+        const mx = lastPointerX;
+        const my = lastPointerY;
+        if (mx >= 0 && my >= 0) {
+          const cardW = 170, cardH = 130, gap = 20;
+          const totalW = cardW * 4 + gap * 3;
+          const sx = (viewW - totalW) * 0.5;
+          const sy = 220;
+          for (let i = 0; i < 4; i++) {
+            const x = sx + i * (cardW + gap);
+            if (mx >= x && mx <= x + cardW && my >= sy && my <= sy + cardH) {
+              selectedChar = i;
+              startGame();
+              return;
+            }
+          }
+        }
+        // Space/click outside cards starts with selected char.
+        startGame();
+        return;
+      }
+
+      if (state === STATE_PLAY && player.onGround) {
+        player.vy = player.jumpV;
+        player.onGround = false;
+        playJumpSound();
+      }
+    }
+
+    let lastPointerX = -1, lastPointerY = -1;
+    function updatePointerFromEvent(e) {
+      const rx = e.clientX / cssW;
+      const ry = e.clientY / cssH;
+      lastPointerX = (rx * BASE_W);
+      lastPointerY = (ry * BASE_H);
+    }
+
+    window.addEventListener('pointermove', updatePointerFromEvent, { passive: true });
+    window.addEventListener('pointerdown', updatePointerFromEvent, { passive: true });
+    window.addEventListener('mousemove', updatePointerFromEvent, { passive: true });
+
+    function updatePlay(dt) {
+      // score: gradual and steady, exact win trigger at 5000
+      world.score = Math.min(5000, world.score + world.scoreRate * dt);
+
+      // difficulty progression (smooth)
+      world.difficulty = world.score / 5000;
+      world.baseSpeed = lerp(270, 420, world.difficulty);
+      world.speed = world.baseSpeed * world.speedScale;
+      world.spawnInterval = lerp(1.45, 0.62, world.difficulty);
+      world.bgT = world.difficulty;
+
+      if (world.score >= 5000 && !world.stopSpawn) {
+        world.stopSpawn = true;
+        emitWinParticles();
+        state = STATE_WIN;
+      }
+
+      // player physics
+      player.vy += player.gravity * dt;
+      player.y += player.vy * dt;
+      if (player.y >= world.groundY - player.h) {
+        player.y = world.groundY - player.h;
+        player.vy = 0;
+        player.onGround = true;
+      }
+
+      // spawning
+      if (!world.stopSpawn) {
+        world.spawnTimer += dt;
+        if (world.spawnTimer >= world.spawnInterval) {
+          world.spawnTimer -= world.spawnInterval;
+          spawnObstacle();
+        }
+      }
+
+      // obstacle update + collision
+      for (let i = 0; i < OB_MAX; i++) {
+        const o = obstacles[i];
+        if (!o.active) continue;
+
+        o.x -= world.speed * dt;
+        if (o.type === 2) {
+          o.phase += o.speedY * dt;
+          o.y = (world.groundY - o.h - 12) + Math.sin(o.phase) * o.amp;
+        }
+
+        if (o.x + o.w < -40) { freeObstacle(o); continue; }
+
+        if (obstacleHit(o, player.x + 6, player.y + 4, player.w - 12, player.h - 8)) {
+          returnToMenu();
+          return;
+        }
+      }
+    }
+
+    function updateWin(dt) {
+      world.winT += dt;
+      world.speedScale = Math.max(0, world.speedScale - dt * 0.65);
+      world.speed = world.baseSpeed * world.speedScale;
+      world.winTextT = clamp(world.winTextT + dt * 0.8, 0, 1);
+      world.bgT = clamp(world.bgT + dt * 0.6, 0, 1.1);
+
+      player.bounceT += dt * 5.2;
+      const bounce = Math.abs(Math.sin(player.bounceT)) * 14;
+      player.y = world.groundY - player.h - bounce;
+
+      // keep scrolling remaining obstacles away
+      for (let i = 0; i < OB_MAX; i++) {
+        const o = obstacles[i];
+        if (!o.active) continue;
+        o.x -= world.speed * dt;
+        if (o.x + o.w < -40) freeObstacle(o);
+      }
+
+      updateParticles(dt);
+
+      if (world.winT > 3.4) {
+        returnToMenu();
+      }
+    }
+
+    function updateMenu(dt, t) {
+      world.bgT = 0.12 + Math.sin(t * 0.2) * 0.03;
+      // subtle idle bounce for preview character
+      player.bounceT += dt * 2;
+    }
+
+    // --- Rendering ---------------------------------------------------------
+    function setViewTransform() {
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, cssW, cssH);
+      const ox = (cssW - BASE_W * scale) * 0.5;
+      const oy = (cssH - BASE_H * scale) * 0.5;
+      ctx.setTransform(scale * dpr, 0, 0, scale * dpr, ox * dpr, oy * dpr);
+    }
+
+    function bgColor() {
+      const t = clamp(world.bgT, 0, 1);
+      const r = (lerp(18, 251, t)) | 0;
+      const g = (lerp(24, 191, t)) | 0;
+      const b = (lerp(48, 36, t)) | 0;
+      return `rgb(${r},${g},${b})`;
+    }
+
+    function drawBackground() {
+      ctx.fillStyle = bgColor();
+      ctx.fillRect(0, 0, viewW, viewH);
+
+      ctx.fillStyle = 'rgba(255,255,255,0.08)';
+      const y = world.groundY + 20;
+      for (let x = -((world.scroll * 0.2) % 60); x < viewW; x += 60) {
+        ctx.fillRect(x, y, 36, 4);
+      }
+
+      ctx.fillStyle = 'rgba(0,0,0,0.2)';
+      ctx.fillRect(0, world.groundY, viewW, viewH - world.groundY);
+    }
+
+    function drawCharacterShape(type, x, y, w, h, anim = 0) {
+      const color = CHARACTERS[type].color;
+      ctx.save();
+      ctx.translate(x, y - anim);
+      ctx.fillStyle = color;
+
+      if (type === 0) {
+        ctx.fillRect(0, 0, w, h);
+        ctx.fillStyle = '#0f172a';
+        ctx.fillRect(w*0.25, h*0.3, w*0.12, h*0.12);
+        ctx.fillRect(w*0.63, h*0.3, w*0.12, h*0.12);
+        ctx.fillRect(w*0.28, h*0.62, w*0.45, h*0.08);
+      } else if (type === 1) {
+        ctx.beginPath();
+        ctx.arc(w*0.5, h*0.5, w*0.5, 0, Math.PI*2);
+        ctx.fill();
+        ctx.fillStyle = '#0f172a';
+        ctx.beginPath(); ctx.arc(w*0.34, h*0.42, w*0.06, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(w*0.66, h*0.42, w*0.06, 0, Math.PI*2); ctx.fill();
+      } else if (type === 2) {
+        ctx.fillRect(0, 0, w, h);
+        ctx.fillStyle = '#111827';
+        ctx.fillRect(w*0.1, h*0.12, w*0.8, h*0.2);
+        ctx.fillStyle = '#e5e7eb';
+        ctx.fillRect(w*0.2, h*0.42, w*0.2, h*0.2);
+        ctx.fillRect(w*0.6, h*0.42, w*0.2, h*0.2);
+      } else {
+        ctx.fillRect(0, h*0.15, w, h*0.85);
+        ctx.beginPath();
+        ctx.moveTo(w*0.15, h*0.15); ctx.lineTo(w*0.32, -1); ctx.lineTo(w*0.46, h*0.15);
+        ctx.moveTo(w*0.54, h*0.15); ctx.lineTo(w*0.68, -1); ctx.lineTo(w*0.85, h*0.15);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    function drawPlayer() {
+      drawCharacterShape(selectedChar, player.x, player.y, player.w, player.h);
+    }
+
+    function drawObstacle(o) {
+      ctx.fillStyle = '#111827';
+      if (o.type === 0) {
+        ctx.beginPath();
+        ctx.moveTo(o.x, o.y + o.h);
+        ctx.lineTo(o.x + o.w * 0.5, o.y);
+        ctx.lineTo(o.x + o.w, o.y + o.h);
+        ctx.closePath();
+        ctx.fill();
+      } else if (o.type === 1) {
+        const w = o.w * 0.48;
+        for (let i = 0; i < 2; i++) {
+          const x = o.x + i * (w + 3);
+          ctx.beginPath();
+          ctx.moveTo(x, o.y + o.h);
+          ctx.lineTo(x + w * 0.5, o.y);
+          ctx.lineTo(x + w, o.y + o.h);
+          ctx.closePath();
+          ctx.fill();
+        }
+      } else if (o.type === 2) {
+        ctx.fillRect(o.x, o.y, o.w, o.h);
+      } else if (o.type === 3) {
+        ctx.fillRect(o.x, o.y, o.w, o.h);
+        const by = o.y + o.h + 88;
+        ctx.fillRect(o.x, by, o.w, world.groundY - by);
+      } else {
+        ctx.fillRect(o.x, o.y, o.w, o.h);
+      }
+    }
+
+    function drawScore() {
+      ctx.fillStyle = 'rgba(255,255,255,0.95)';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.font = '700 30px system-ui, sans-serif';
+      ctx.fillText((world.score | 0).toString(), viewW * 0.5, 20);
+    }
+
+    function drawMenu(time) {
+      ctx.fillStyle = 'rgba(255,255,255,0.95)';
+      ctx.textAlign = 'center';
+      ctx.font = '700 44px system-ui, sans-serif';
+      ctx.fillText('GEOMETRY DASH LITE', viewW * 0.5, 66);
+      ctx.font = '500 20px system-ui, sans-serif';
+      ctx.fillText('Select a character (tap/click/space to start)', viewW * 0.5, 114);
+
+      const cardW = 170, cardH = 130, gap = 20;
+      const totalW = cardW * 4 + gap * 3;
+      const sx = (viewW - totalW) * 0.5;
+      const sy = 220;
+      for (let i = 0; i < 4; i++) {
+        const x = sx + i * (cardW + gap);
+        const selected = i === selectedChar;
+        ctx.fillStyle = selected ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.12)';
+        ctx.fillRect(x, sy, cardW, cardH);
+        ctx.strokeStyle = selected ? '#ffffff' : 'rgba(255,255,255,0.35)';
+        ctx.lineWidth = selected ? 3 : 1.5;
+        ctx.strokeRect(x, sy, cardW, cardH);
+
+        const bob = Math.sin(time * 0.004 + i) * 5;
+        drawCharacterShape(i, x + 58, sy + 34, 54, 54, bob);
+
+        ctx.fillStyle = 'rgba(255,255,255,0.96)';
+        ctx.font = '500 14px system-ui, sans-serif';
+        ctx.fillText(CHARACTERS[i].name, x + cardW * 0.5, sy + 112);
+      }
+
+      ctx.font = '500 17px system-ui, sans-serif';
+      ctx.fillStyle = 'rgba(255,255,255,0.9)';
+      ctx.fillText('Touch / Click / Space to jump', viewW * 0.5, 410);
+      ctx.fillText('Reach 5000 score to win', viewW * 0.5, 438);
+    }
+
+    function drawWinOverlay() {
+      for (let i = 0; i < P_MAX; i++) {
+        const p = particles[i];
+        if (!p.active) continue;
+        const a = clamp(p.life, 0, 1);
+        ctx.fillStyle = `rgba(255,255,255,${a})`;
+        ctx.fillRect(p.x, p.y, p.size, p.size);
+      }
+
+      const t = world.winTextT;
+      const alpha = clamp(t, 0, 1);
+      const scl = lerp(0.7, 1.08, t);
+      ctx.save();
+      ctx.translate(viewW * 0.5, 145);
+      ctx.scale(scl, scl);
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = 'white';
+      ctx.textAlign = 'center';
+      ctx.font = '700 68px system-ui, sans-serif';
+      ctx.fillText('YOU WIN', 0, 0);
+      ctx.restore();
+    }
+
+    // --- Main loop ---------------------------------------------------------
+    let prev = performance.now();
+    function frame(now) {
+      requestAnimationFrame(frame);
+      const dtRaw = (now - prev) * 0.001;
+      prev = now;
+      const dt = Math.min(dtRaw, 0.033);
+
+      world.scroll += world.speed * dt;
+      doJumpIfRequested();
+
+      if (state === STATE_PLAY) {
+        updatePlay(dt);
+      } else if (state === STATE_WIN) {
+        updateWin(dt);
+      } else {
+        updateMenu(dt, now);
+      }
+
+      setViewTransform();
+      drawBackground();
+
+      if (state !== STATE_MENU) {
+        for (let i = 0; i < OB_MAX; i++) {
+          const o = obstacles[i];
+          if (o.active) drawObstacle(o);
+        }
+        drawPlayer();
+        drawScore();
+        if (state === STATE_WIN) drawWinOverlay();
+      } else {
+        drawMenu(now);
+      }
+    }
+
+    resetWorld();
+    requestAnimationFrame(frame);
+  })();
+  </script>
+</body>
+</html>
