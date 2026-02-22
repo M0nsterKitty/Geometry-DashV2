@@ -54,14 +54,110 @@
     window.addEventListener('resize', resize, { passive: true });
     resize();
 
-    // --- Audio (single context, tiny synthesized jump sound) --------------
+    // --- Audio (single context, lightweight procedural music + SFX) -------
     let audioCtx = null;
     let audioUnlocked = false;
+    const music = {
+      master: null,
+      musicGain: null,
+      sfxGain: null,
+      started: false,
+      enabled: false,
+      nextNoteTime: 0,
+      step: 0,
+      fadeValue: 0,
+      fadeTarget: 0,
+      melody: [0, 3, 7, 10, 7, 3, 5, 3],
+      baseHz: 220
+    };
 
     function ensureAudio() {
       if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       if (!audioUnlocked && audioCtx.state === 'suspended') audioCtx.resume();
+      if (!music.master) {
+        music.master = audioCtx.createGain();
+        music.musicGain = audioCtx.createGain();
+        music.sfxGain = audioCtx.createGain();
+        music.master.gain.value = 0;
+        music.musicGain.gain.value = 0.22;
+        music.sfxGain.gain.value = 0.2;
+        music.musicGain.connect(music.master);
+        music.sfxGain.connect(music.master);
+        music.master.connect(audioCtx.destination);
+      }
       audioUnlocked = true;
+    }
+
+    function setMusicTarget(v) {
+      music.fadeTarget = clamp(v, 0, 1);
+    }
+
+    function startMusic() {
+      if (!audioCtx || audioCtx.state !== 'running') return;
+      if (!music.started) {
+        music.started = true;
+        music.step = 0;
+        music.nextNoteTime = audioCtx.currentTime + 0.02;
+      }
+      music.enabled = true;
+      setMusicTarget(1);
+    }
+
+    function stopMusic() {
+      music.enabled = false;
+      setMusicTarget(0);
+    }
+
+    function scheduleTone(freq, t, dur, gainAmt, type) {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, t);
+      gain.gain.setValueAtTime(0.0001, t);
+      gain.gain.exponentialRampToValueAtTime(gainAmt, t + 0.006);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      osc.connect(gain);
+      gain.connect(music.musicGain);
+      osc.start(t);
+      osc.stop(t + dur + 0.01);
+    }
+
+    function scheduleBeat(t, difficulty) {
+      const note = music.melody[music.step % music.melody.length];
+      const freq = music.baseHz * Math.pow(2, note / 12);
+      scheduleTone(freq, t, 0.12, 0.045, 'triangle');
+      if ((music.step & 1) === 0) {
+        scheduleTone(freq * 0.5, t, 0.09, 0.03, 'sine');
+      }
+      const click = audioCtx.createOscillator();
+      const clickGain = audioCtx.createGain();
+      click.type = 'square';
+      click.frequency.setValueAtTime(1500 + difficulty * 250, t);
+      click.frequency.exponentialRampToValueAtTime(300, t + 0.03);
+      clickGain.gain.setValueAtTime(0.0001, t);
+      clickGain.gain.exponentialRampToValueAtTime(0.016, t + 0.002);
+      clickGain.gain.exponentialRampToValueAtTime(0.0001, t + 0.035);
+      click.connect(clickGain);
+      clickGain.connect(music.musicGain);
+      click.start(t);
+      click.stop(t + 0.04);
+      music.step++;
+    }
+
+    function updateAudio(dt) {
+      if (!audioCtx || !music.master) return;
+      music.fadeValue += (music.fadeTarget - music.fadeValue) * Math.min(1, dt * 5.5);
+      music.master.gain.value = music.fadeValue * music.fadeValue * 0.9;
+      if (!music.started || !music.enabled || audioCtx.state !== 'running') return;
+
+      const difficulty = world.difficulty;
+      const bpm = lerp(122, 148, difficulty);
+      const beat = 60 / bpm;
+      const lookahead = audioCtx.currentTime + 0.14;
+      while (music.nextNoteTime < lookahead) {
+        scheduleBeat(music.nextNoteTime, difficulty);
+        music.nextNoteTime += beat * 0.5;
+      }
     }
 
     function playJumpSound() {
@@ -70,15 +166,15 @@
       const osc = audioCtx.createOscillator();
       const gain = audioCtx.createGain();
       osc.type = 'square';
-      osc.frequency.setValueAtTime(880, now);
-      osc.frequency.exponentialRampToValueAtTime(330, now + 0.08);
+      osc.frequency.setValueAtTime(960, now);
+      osc.frequency.exponentialRampToValueAtTime(420, now + 0.06);
       gain.gain.setValueAtTime(0.0001, now);
-      gain.gain.exponentialRampToValueAtTime(0.09, now + 0.005);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.09);
+      gain.gain.exponentialRampToValueAtTime(0.08, now + 0.003);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.065);
       osc.connect(gain);
-      gain.connect(audioCtx.destination);
+      gain.connect(music.sfxGain || audioCtx.destination);
       osc.start(now);
-      osc.stop(now + 0.095);
+      osc.stop(now + 0.07);
     }
 
     // --- Utilities ---------------------------------------------------------
@@ -128,7 +224,11 @@
       gravity: 2200,
       jumpV: -760,
       onGround: false,
-      bounceT: 0
+      bounceT: 0,
+      rot: 0,
+      rotVel: 0,
+      squash: 0,
+      stretch: 0
     };
 
     function resetPlayer() {
@@ -139,6 +239,10 @@
       player.vy = 0;
       player.onGround = true;
       player.bounceT = 0;
+      player.rot = 0;
+      player.rotVel = 0;
+      player.squash = 0;
+      player.stretch = 0;
     }
 
     function resetWorld() {
@@ -164,11 +268,13 @@
     function startGame() {
       resetWorld();
       state = STATE_PLAY;
+      startMusic();
     }
 
     function returnToMenu() {
       state = STATE_MENU;
       resetWorld();
+      stopMusic();
     }
 
     // --- Input (low-latency, no buffering queue) --------------------------
@@ -346,6 +452,8 @@
       if (state === STATE_PLAY && player.onGround) {
         player.vy = player.jumpV;
         player.onGround = false;
+        player.rotVel = (Math.PI * 2) / ((-2 * player.jumpV) / player.gravity);
+        player.stretch = 1;
         playJumpSound();
       }
     }
@@ -377,15 +485,22 @@
         world.stopSpawn = true;
         emitWinParticles();
         state = STATE_WIN;
+        stopMusic();
       }
 
       // player physics
       player.vy += player.gravity * dt;
       player.y += player.vy * dt;
+      if (!player.onGround) player.rot += player.rotVel * dt;
+      player.stretch = Math.max(0, player.stretch - dt * 6);
+      player.squash = Math.max(0, player.squash - dt * 7);
       if (player.y >= world.groundY - player.h) {
+        const landingSpeed = player.vy;
         player.y = world.groundY - player.h;
         player.vy = 0;
+        player.rot = 0;
         player.onGround = true;
+        player.squash = Math.max(player.squash, clamp(landingSpeed / 1200, 0, 1));
       }
 
       // spawning
@@ -427,6 +542,7 @@
       player.bounceT += dt * 5.2;
       const bounce = Math.abs(Math.sin(player.bounceT)) * 14;
       player.y = world.groundY - player.h - bounce;
+      player.rot = 0;
 
       // keep scrolling remaining obstacles away
       for (let i = 0; i < OB_MAX; i++) {
@@ -458,26 +574,44 @@
       ctx.setTransform(scale * dpr, 0, 0, scale * dpr, ox * dpr, oy * dpr);
     }
 
-    function bgColor() {
-      const t = clamp(world.bgT, 0, 1);
-      const r = (lerp(18, 251, t)) | 0;
-      const g = (lerp(24, 191, t)) | 0;
-      const b = (lerp(48, 36, t)) | 0;
-      return `rgb(${r},${g},${b})`;
-    }
-
     function drawBackground() {
-      ctx.fillStyle = bgColor();
-      ctx.fillRect(0, 0, viewW, viewH);
+      const t = clamp(world.bgT, 0, 1);
+      const phase = performance.now() * 0.00015;
+      const top = `hsl(${lerp(230, 278, t) + Math.sin(phase) * 8} 72% 11%)`;
+      const bot = `hsl(${lerp(255, 310, t) + Math.cos(phase * 1.3) * 10} 80% 6%)`;
+      const grad = ctx.createLinearGradient(0, 0, 0, world.groundY + 30);
+      grad.addColorStop(0, top);
+      grad.addColorStop(1, bot);
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, viewW, world.groundY + 30);
 
-      ctx.fillStyle = 'rgba(255,255,255,0.08)';
-      const y = world.groundY + 20;
-      for (let x = -((world.scroll * 0.2) % 60); x < viewW; x += 60) {
-        ctx.fillRect(x, y, 36, 4);
+      const glow = ctx.createLinearGradient(0, 0, viewW, world.groundY);
+      glow.addColorStop(0, 'rgba(64,88,255,0.09)');
+      glow.addColorStop(0.5, 'rgba(255,0,200,0.08)');
+      glow.addColorStop(1, 'rgba(32,255,236,0.09)');
+      ctx.fillStyle = glow;
+      ctx.fillRect(0, 0, viewW, world.groundY);
+
+      ctx.fillStyle = 'rgba(255,255,255,0.05)';
+      const skyOffset = (world.scroll * 0.08) % 80;
+      for (let x = -skyOffset; x < viewW + 80; x += 80) {
+        ctx.fillRect(x, world.groundY - 120, 34, 2);
       }
 
-      ctx.fillStyle = 'rgba(0,0,0,0.2)';
+      ctx.fillStyle = 'rgba(7,10,20,0.92)';
       ctx.fillRect(0, world.groundY, viewW, viewH - world.groundY);
+
+      const pulse = 0.45 + 0.25 * Math.sin(performance.now() * 0.008);
+      ctx.fillStyle = `rgba(75,255,230,${pulse})`;
+      ctx.fillRect(0, world.groundY - 2, viewW, 3);
+      ctx.fillStyle = 'rgba(75,255,230,0.22)';
+      ctx.fillRect(0, world.groundY + 2, viewW, 1);
+
+      const groundOffset = (world.scroll * 0.55) % 46;
+      ctx.fillStyle = 'rgba(255,255,255,0.1)';
+      for (let x = -groundOffset; x < viewW + 46; x += 46) {
+        ctx.fillRect(x, world.groundY + 12, 22, 3);
+      }
     }
 
     function drawCharacterShape(type, x, y, w, h, anim = 0) {
@@ -517,11 +651,20 @@
     }
 
     function drawPlayer() {
-      drawCharacterShape(selectedChar, player.x, player.y, player.w, player.h);
+      const sx = 1 + player.stretch * 0.08 - player.squash * 0.12;
+      const sy = 1 - player.stretch * 0.12 + player.squash * 0.1;
+      ctx.save();
+      ctx.translate(player.x + player.w * 0.5, player.y + player.h * 0.5);
+      ctx.rotate(player.rot);
+      ctx.scale(sx, sy);
+      drawCharacterShape(selectedChar, -player.w * 0.5, -player.h * 0.5, player.w, player.h);
+      ctx.restore();
     }
 
     function drawObstacle(o) {
-      ctx.fillStyle = '#111827';
+      ctx.fillStyle = '#ffffff';
+      ctx.strokeStyle = 'rgba(155,255,245,0.35)';
+      ctx.lineWidth = 1;
       if (o.type === 0) {
         ctx.beginPath();
         ctx.moveTo(o.x, o.y + o.h);
@@ -529,6 +672,7 @@
         ctx.lineTo(o.x + o.w, o.y + o.h);
         ctx.closePath();
         ctx.fill();
+        ctx.stroke();
       } else if (o.type === 1) {
         const w = o.w * 0.48;
         for (let i = 0; i < 2; i++) {
@@ -539,15 +683,20 @@
           ctx.lineTo(x + w, o.y + o.h);
           ctx.closePath();
           ctx.fill();
+          ctx.stroke();
         }
       } else if (o.type === 2) {
         ctx.fillRect(o.x, o.y, o.w, o.h);
+        ctx.strokeRect(o.x + 0.5, o.y + 0.5, o.w - 1, o.h - 1);
       } else if (o.type === 3) {
         ctx.fillRect(o.x, o.y, o.w, o.h);
         const by = o.y + o.h + 88;
         ctx.fillRect(o.x, by, o.w, world.groundY - by);
+        ctx.strokeRect(o.x + 0.5, o.y + 0.5, o.w - 1, o.h - 1);
+        ctx.strokeRect(o.x + 0.5, by + 0.5, o.w - 1, world.groundY - by - 1);
       } else {
         ctx.fillRect(o.x, o.y, o.w, o.h);
+        ctx.strokeRect(o.x + 0.5, o.y + 0.5, o.w - 1, o.h - 1);
       }
     }
 
@@ -635,6 +784,7 @@
       } else {
         updateMenu(dt, now);
       }
+      updateAudio(dt);
 
       setViewTransform();
       drawBackground();
